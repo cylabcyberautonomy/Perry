@@ -1,0 +1,18 @@
+---
+- name: Ping all hosts to test connectivity
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Test connectivity with ping module
+      ansible.builtin.ping:
+      register: ping_result
+
+    - name: Display ping results
+      ansible.builtin.debug:
+        msg: "Host {{ inventory_hostname }} is reachable"
+      when: ping_result is succeeded
+
+    - name: Display failure message
+      ansible.builtin.debug:
+        msg: "Host {{ inventory_hostname }} is NOT reachable"
+      when: ping_result is failed

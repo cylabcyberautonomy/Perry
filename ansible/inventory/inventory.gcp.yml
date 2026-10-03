@@ -1,0 +1,13 @@
+
+plugin: google.cloud.gcp_compute
+projects:
+  - perry-439922
+auth_kind: application
+hostnames:
+  - name
+compose:
+  gcp_zone: zone
+  ansible_host: "'localhost'"
+  ansible_user: "'setup_service'"
+  ansible_ssh_private_key_file: "'~/.ssh/google_compute_engine'"
+  ansible_ssh_common_args: "'-o CheckHostIP=no -o HashKnownHosts=no -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand=\"gcloud compute start-iap-tunnel ' + name + ' %p --listen-on-stdin --zone=' + zone + '\"'"

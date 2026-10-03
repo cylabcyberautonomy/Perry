@@ -1,0 +1,19 @@
+---
+# For hosts built from ubuntu_telemetry, which already has sysflow correctly
+# installed and configured (CO-RE driver, systemd drop-in) at image-bake
+# time via MHBench's install_sysflow_nostart.yml - same image every real
+# database host in this topology boots from and successfully runs
+# start_sysflow.yml's bare "sysflow start" against, unmodified. Only the
+# per-experiment Elasticsearch pipeline config (dynamic - a baked image can't
+# know it ahead of time) and the actual start need to happen live.
+- hosts: "{{ host }}"
+  remote_user: root
+
+  tasks:
+    - name: Copy config
+      ansible.builtin.copy:
+        src: "pipeline.local.json"
+        dest: "/etc/sysflow/pipelines/pipeline.local.json"
+
+    - name: Start sysflow
+      command: "sysflow start"

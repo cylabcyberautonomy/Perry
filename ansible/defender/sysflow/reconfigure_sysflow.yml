@@ -1,0 +1,33 @@
+---
+# For REAL topology hosts, which are already running sysflow when the defender
+# starts - MHBench's online registry runs start_sysflow.yml against every
+# *_instrumented host at configure time, using the pipeline config baked into
+# the image. That baked config points the exporter at a different
+# Elasticsearch (see MHBench's aux_files/pipeline.local.json), so none of their
+# telemetry ever reached the defender's own ES and its detection rules - which
+# key off the SOURCE host's process/network events, not the decoy's - could
+# never fire. Overwrite the exporter target with this experiment's ES and
+# restart so it takes effect.
+#
+# Unlike configure_and_start_sysflow.yml (used on a freshly-booted decoy, where
+# sysflow has never run), this restarts rather than starts: sf-processor reads
+# pipeline.local.json once at startup. Processor first, then collector, so the
+# consumer is listening before the producer reconnects to it.
+- hosts: "{{ host }}"
+  remote_user: root
+
+  tasks:
+    - name: Point the sysflow exporter at the defender's Elasticsearch
+      ansible.builtin.copy:
+        src: "pipeline.local.json"
+        dest: "/etc/sysflow/pipelines/pipeline.local.json"
+      register: pipeline_cfg
+
+    - name: Restart sysflow so the new exporter target takes effect
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - sysflow-processor
+        - sysflow-collector
+      when: pipeline_cfg.changed

@@ -1,0 +1,18 @@
+---
+- hosts: "{{ hosts }}"
+  tasks:
+    - name: block IP and port (INPUT)
+      become: true
+      shell:
+        cmd: iptables -A INPUT -s {{ ip_to_block }} -p tcp --dport {{ port_to_block }} -j DROP
+      register: iptables_input_output
+      failed_when: iptables_input_output.rc != 0
+      changed_when: iptables_input_output.rc == 0
+
+    - name: block IP and port (OUTPUT)
+      become: true
+      shell:
+        cmd: iptables -A OUTPUT -d {{ ip_to_block }} -p tcp --dport {{ port_to_block }} -j DROP
+      register: iptables_output_result
+      failed_when: iptables_output_result.rc != 0
+      changed_when: iptables_output_result.rc == 0

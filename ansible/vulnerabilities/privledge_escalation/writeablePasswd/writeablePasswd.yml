@@ -1,0 +1,7 @@
+---
+- hosts: "{{ to_host_ip }}"
+  remote_user: root
+
+  tasks:
+  - name: Set vulnerable passwd permissions
+    shell: chmod 666 /etc/passwd

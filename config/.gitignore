@@ -1,0 +1,4 @@
+# Ignore everything in this directory
+*.json
+# And config_example
+!config_example.json

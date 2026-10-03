@@ -1,0 +1,55 @@
+---
+# Shared task file: repoint Ubuntu apt sources at a reachable snapshot.ubuntu.com
+# tree. Import (not include) this at the top of any play whose tasks use apt.
+#
+# Why this is needed at all: from this cluster's instance subnets, the live
+# Ubuntu mirrors are unreachable - apt-get update fails with "does not have a
+# Release file" for archive.ubuntu.com, security.ubuntu.com and
+# nova.clouds.archive.ubuntu.com alike. It is not a Canonical outage; the
+# management host fetches those same files fine at the same moment. Focal is a
+# second, separate case: it is past end of standard support, so Canonical has
+# pruned it from the live CDN entirely (old-releases.ubuntu.com does not carry
+# it either - its dists/ listing stops at zesty).
+#
+# Every MHBench image is baked with stock sources, so a freshly booted host -
+# including a freshly deployed decoy - always needs this before its first apt
+# task. The same block already lives inline in
+# deployment_instance/install_base_packages/install_base_packages.yml and
+# defender/falco/install_falco.yml; this file exists so the honey-service
+# playbooks do not become a fourth copy.
+
+- name: Point Focal apt sources at a pre-EOL snapshot.ubuntu.com snapshot
+  # https, not http: snapshot.ubuntu.com 301-redirects http to https and apt does
+  # not follow redirects. The negative lookahead excludes snapshot.ubuntu.com
+  # itself, without which this is not idempotent - a retry would append another
+  # /20240401T000000Z on top of the last one.
+  ansible.builtin.replace:
+    path: /etc/apt/sources.list
+    regexp: 'https?://(?!snapshot\.ubuntu\.com)[a-zA-Z0-9][a-zA-Z0-9.-]*\.ubuntu\.com/ubuntu'
+    replace: 'https://snapshot.ubuntu.com/ubuntu/20240401T000000Z'
+  when: ansible_distribution == "Ubuntu" and ansible_distribution_release == "focal"
+
+- name: Point Noble apt sources at a snapshot.ubuntu.com snapshot
+  ansible.builtin.replace:
+    path: /etc/apt/sources.list
+    regexp: 'https?://(?!snapshot\.ubuntu\.com)[a-zA-Z0-9][a-zA-Z0-9.-]*\.ubuntu\.com/ubuntu'
+    replace: 'https://snapshot.ubuntu.com/ubuntu/20260101T000000Z'
+  when: ansible_distribution == "Ubuntu" and ansible_distribution_release == "noble"
+
+- name: Check for Noble's deb822-format sources file
+  # Noble cloud images default to deb822 at /etc/apt/sources.list.d/ubuntu.sources
+  # and ship /etc/apt/sources.list empty or absent, which makes the legacy-format
+  # replace above a silent no-op. This is exactly what bit the decoys.
+  ansible.builtin.stat:
+    path: /etc/apt/sources.list.d/ubuntu.sources
+  register: ubuntu_sources_deb822
+  when: ansible_distribution == "Ubuntu" and ansible_distribution_release == "noble"
+
+- name: Point Noble's deb822 apt sources at the same snapshot.ubuntu.com snapshot
+  ansible.builtin.replace:
+    path: /etc/apt/sources.list.d/ubuntu.sources
+    regexp: 'https?://(?!snapshot\.ubuntu\.com)[a-zA-Z0-9][a-zA-Z0-9.-]*\.ubuntu\.com/ubuntu'
+    replace: 'https://snapshot.ubuntu.com/ubuntu/20260101T000000Z'
+  when:
+    - ansible_distribution == "Ubuntu" and ansible_distribution_release == "noble"
+    - ubuntu_sources_deb822.stat.exists

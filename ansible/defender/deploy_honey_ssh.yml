@@ -1,0 +1,40 @@
+---
+- hosts: "{{ host }}"
+  remote_user: root
+
+  tasks:
+
+  # Must run before any apt task: these plays target freshly booted hosts
+  # (decoys) whose baked sources point at mirrors unreachable from the
+  # instance subnets, which failed 'Install pip' on every decoy.
+  - name: Repoint apt at a reachable snapshot mirror
+    ansible.builtin.import_tasks: apt_snapshot_pin.yml
+
+  - name: Install pip and venv support
+    ansible.builtin.apt:
+      name:
+        - python3-pip
+        - python3-venv
+        - git            # the honeyservice package is installed from git+https://
+      state: present
+      update_cache: yes
+      # These plays run against a host that booted moments ago, so cloud-init
+      # and unattended-upgrades may still hold the apt lock. Wait for it rather
+      # than failing the whole decoy deployment.
+      lock_timeout: 300
+
+  - name: Install honeyservice package into a dedicated virtualenv
+    # Noble's system Python is PEP 668 "externally managed" and refuses a
+    # system-wide pip install outright ("error: externally-managed-environment").
+    # A venv rather than --break-system-packages: the decoy also runs sysflow and
+    # falco, and the defender's detection depends on them, so honeypot
+    # dependencies must not be able to mutate the Python those agents use.
+    ansible.builtin.pip:
+      name: git+https://github.com/DeceptionProjects/FakeNetworkServices.git
+      virtualenv: /opt/honeyservice
+      virtualenv_command: python3 -m venv
+
+  - name: Run honey ssh server
+    command: /opt/honeyservice/bin/python -m fake_network_services.FakeNetworkService -p 8000 -s ssh -l {{ elasticsearch_server }} --api-key="{{ elasticsearch_api_key }}"
+    async: 1000
+    poll: 0

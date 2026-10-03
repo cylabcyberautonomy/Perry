@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Local secrets - never commit
+.env
+.venv/
+
+# Vendored binaries are not shipped — fetch/obtain at setup (see docs)
+*.deb

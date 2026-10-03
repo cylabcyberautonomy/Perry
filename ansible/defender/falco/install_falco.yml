@@ -1,0 +1,278 @@
+---
+# playbooks/falco_elastic.yml
+- name: Install Falco and forward alerts to Elasticsearch
+  hosts: "{{ host }}"
+  become: yes
+
+  vars:
+    # ---- Editable vars -------------------------------------------------
+    falco_version: ""               # blank = latest from repo (matches MHBench's bake)
+    falcosidekick_version: "2.31.1" # pin if you like; blank = latest
+    es_address: "https://elasticsearch.example.com:9200"  # Include protocol and port
+    es_user: "elastic"
+    es_password: "changeme"
+    es_index: "falco"
+    # -------------------------------------------------------------------
+
+  tasks:
+  - name: Check whether Falco is already installed
+    # Every MHBench *_telemetry image already has falco installed (baked by
+    # bake_ubuntu_base.yml -> install_falco_nostart.yml) and started at boot
+    # (start_defender_services.yml). Re-running the apt path on those hosts is
+    # pure downside: it raced cloud-init/unattended-upgrades for the apt and
+    # dpkg locks and failed the arming step outright. Only hosts genuinely
+    # lacking falco - e.g. the kali attacker, whose image bakes none - take it.
+    # dpkg-query rather than a stat on a guessed binary path: a false negative
+    # here re-triggers the very apt race this is meant to avoid.
+    ansible.builtin.command: dpkg-query -W -f='${Status}' falco
+    register: falco_pkg
+    changed_when: false
+    failed_when: false
+
+  - name: Point Focal apt sources at a pre-EOL snapshot.ubuntu.com snapshot
+    # Focal (20.04) reached end of standard support in April 2025 - Canonical
+    # prunes an EOL release from the live CDN mirrors entirely (archive.ubuntu.com,
+    # security.ubuntu.com, and cloud-provider mirrors like
+    # nova.clouds.archive.ubuntu.com all stop serving it, with no Release file at
+    # those paths any more), so `apt-get update` fails outright. old-releases.ubuntu.com
+    # (the usual fallback for an EOL release) was tried first and confirmed NOT to
+    # work either - as of this environment's current date its dists/ listing only
+    # goes up through zesty (17.04), nothing from artful/bionic/focal onward - so
+    # this pins to a snapshot.ubuntu.com date (2024-04-01, well inside Focal's
+    # support window) instead, a point-in-time archive that still serves valid,
+    # complete, signed focal/focal-security/focal-updates trees (confirmed live:
+    # https://snapshot.ubuntu.com/ubuntu/20240401T000000Z/dists/focal*/Release all
+    # return 200). https, not http: snapshot.ubuntu.com 301-redirects http to
+    # https, and apt doesn't follow redirects - use https directly (Focal's apt
+    # has native HTTPS transport support, no extra package needed first).
+    ansible.builtin.replace:
+      path: /etc/apt/sources.list
+      # Negative lookahead excludes snapshot.ubuntu.com itself - without it this
+      # isn't idempotent: "snapshot.ubuntu.com/ubuntu/20240401T000000Z" matches the
+      # same pattern it was replaced with, so a rerun (this playbook already
+      # retries 3x per AnsibleRunner.MAX_RETRIES on any failure) would keep
+      # appending another /20240401T000000Z on top of the last one.
+      regexp: 'https?://(?!snapshot\.ubuntu\.com)[a-zA-Z0-9][a-zA-Z0-9.-]*\.ubuntu\.com/ubuntu'
+      replace: 'https://snapshot.ubuntu.com/ubuntu/20240401T000000Z'
+    when: ansible_distribution == "Ubuntu" and ansible_distribution_release == "focal"
+
+  - name: Point Noble apt sources at a snapshot.ubuntu.com snapshot
+    # Same failure as Focal above, for a different reason: apt-get update fails
+    # outright on Noble (24.04) here - "does not have a Release file" for
+    # archive.ubuntu.com, security.ubuntu.com AND nova.clouds.archive.ubuntu.com
+    # alike (not a Canonical outage - the management host fetches those same
+    # files fine at the same moment; it's this cluster's route from the instance
+    # subnets to those mirrors). Every host in the instrumented topologies is
+    # Noble (ubuntu_telemetry / webserver_telemetry), so without this the whole
+    # play died on its second task for all 6 of them and this defender could
+    # never arm. Identical pin to the one already proven in
+    # deployment_instance/install_base_packages/install_base_packages.yml -
+    # which had this fix while this file did not.
+    ansible.builtin.replace:
+      path: /etc/apt/sources.list
+      regexp: 'https?://(?!snapshot\.ubuntu\.com)[a-zA-Z0-9][a-zA-Z0-9.-]*\.ubuntu\.com/ubuntu'
+      replace: 'https://snapshot.ubuntu.com/ubuntu/20260101T000000Z'
+    when: ansible_distribution == "Ubuntu" and ansible_distribution_release == "noble"
+
+  - name: Check for Noble's deb822-format sources file
+    # Ubuntu 24.04 cloud images default to deb822 sources at
+    # /etc/apt/sources.list.d/ubuntu.sources ("URIs: http://...") and ship
+    # /etc/apt/sources.list empty/absent - the legacy-format replace above is a
+    # silent no-op on those images, so patch this file too when present.
+    ansible.builtin.stat:
+      path: /etc/apt/sources.list.d/ubuntu.sources
+    register: ubuntu_sources_deb822
+    when: ansible_distribution == "Ubuntu" and ansible_distribution_release == "noble"
+
+  - name: Point Noble's deb822 apt sources at the same snapshot.ubuntu.com snapshot
+    ansible.builtin.replace:
+      path: /etc/apt/sources.list.d/ubuntu.sources
+      regexp: 'https?://(?!snapshot\.ubuntu\.com)[a-zA-Z0-9][a-zA-Z0-9.-]*\.ubuntu\.com/ubuntu'
+      replace: 'https://snapshot.ubuntu.com/ubuntu/20260101T000000Z'
+    when:
+      - ansible_distribution == "Ubuntu" and ansible_distribution_release == "noble"
+      - ubuntu_sources_deb822.stat.exists
+
+  - name: Ensure base packages are present
+    # No build toolchain (clang/llvm/dkms/make) or kernel headers here - those are
+    # only needed for the kmod/legacy-ebpf drivers, which build a driver locally
+    # against the exact running kernel. falco.yaml below sets engine.kind:
+    # modern_ebpf, a CO-RE (Compile Once - Run Everywhere) driver: falcoctl fetches
+    # one portable prebuilt artifact instead, so it needs no local build and no
+    # exact kernel/headers version match - just a kernel with BTF support (5.8+).
+    # This is what was actually breaking Kali: falco's own postinst still defaults
+    # to building the kmod driver via DKMS unless told otherwise (see
+    # FALCO_DRIVER_CHOICE below), which needed
+    # linux-headers-{{ ansible_kernel }} - a package that doesn't exist for Kali's
+    # rolling repo once it's moved past this image's pinned kernel.
+    apt:
+      name:
+        - curl
+        - gnupg
+        - software-properties-common
+        - apt-transport-https
+      state: present
+      update_cache: yes
+      lock_timeout: 300
+    when: "'install ok installed' not in falco_pkg.stdout"
+
+  - name: Add Falco GPG key
+    shell: |
+      curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | \
+      gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
+    args:
+      creates: /usr/share/keyrings/falco-archive-keyring.gpg
+    when: "'install ok installed' not in falco_pkg.stdout"
+
+  - name: Add Falco apt repository
+    shell: |
+      echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | \
+      tee -a /etc/apt/sources.list.d/falcosecurity.list
+    args:
+      creates: /etc/apt/sources.list.d/falcosecurity.list
+    when: "'install ok installed' not in falco_pkg.stdout"
+
+  - name: Install Falco engine & eBPF driver
+    # FALCO_DRIVER_CHOICE tells the .deb's postinst which driver to prepare -
+    # without it, postinst defaults to kmod (DKMS-building a kernel module against
+    # linux-headers-{{ ansible_kernel }}, which is what actually failed on Kali).
+    # Matches engine.kind: modern_ebpf in falco.yaml below - deliberately NOT
+    # setting FALCOCTL_ENABLED=no, since that disables falcoctl's automatic
+    # artifact-fetching entirely, and modern_ebpf still needs its one prebuilt
+    # CO-RE artifact fetched (it just needs no local build, unlike kmod/ebpf).
+    apt:
+      name: "{{ 'falco=' + falco_version if falco_version else 'falco' }}"
+      state: present
+      update_cache: yes
+      lock_timeout: 300
+    when: "'install ok installed' not in falco_pkg.stdout"
+    environment:
+      FALCO_FRONTEND: noninteractive
+      FALCO_DRIVER_CHOICE: modern_ebpf
+
+  - name: Create Falco configuration from template
+    copy:
+      src: falco.yaml
+      dest: /etc/falco/falco.yaml
+      mode: '0644'
+    notify: Restart Falco
+
+  - name: Determine architecture for falcosidekick
+    set_fact:
+      falcosidekick_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+  - name: Check whether falcosidekick is already installed
+    ansible.builtin.stat:
+      path: /usr/local/bin/falcosidekick
+    register: falcosidekick_binary
+
+  - name: Download and extract falcosidekick
+    unarchive:
+      src: "https://github.com/falcosecurity/falcosidekick/releases/download/{{ falcosidekick_version }}/falcosidekick_{{ falcosidekick_version }}_linux_{{ falcosidekick_arch }}.tar.gz"
+      dest: /tmp
+      remote_src: yes
+      creates: /tmp/falcosidekick
+    when: not falcosidekick_binary.stat.exists
+
+  - name: Move falcosidekick binary to /usr/local/bin
+    copy:
+      src: /tmp/falcosidekick
+      dest: /usr/local/bin/falcosidekick
+      mode: "0755"
+      remote_src: yes
+    when: not falcosidekick_binary.stat.exists
+
+  - name: Clean up temporary falcosidekick files
+    file:
+      path: /tmp/falcosidekick
+      state: absent
+
+  - name: Ensure falcosidekick config directory exists
+    file:
+      path: /etc/falcosidekick
+      state: directory
+      mode: "0755"
+
+  - name: Create falcosidekick configuration file
+    # notify, not just copy: every MHBench *_telemetry image bakes a
+    # falcosidekick config pointing at MHBench's OWN Elasticsearch
+    # (http://<mhbench-es-host>:9200 - see install_falco_nostart.yml's es_address) and
+    # start_defender_services.yml starts the daemon at configure time, long
+    # before this defender arms. falcosidekick reads its config once at startup,
+    # so rewriting the file here changed nothing on those six hosts: the
+    # "Enable & start services" task below is a no-op against an
+    # already-running unit (it logged `ok`, not `changed`), and every victim-host
+    # alert kept being shipped to <mhbench-es-host> where this defender never looks.
+    # Only the Kali attacker - the one host with no baked falco, so falcosidekick
+    # got installed and started fresh here - actually reached the defender's ES,
+    # which is why the falco index contained alerts from `kali` and nothing else
+    # while the attacker demonstrably owned webserver1. Exactly the failure
+    # ReconfigureSysFlow already fixes for sysflow ("sf-processor reads
+    # pipeline.local.json once at startup"), and the same remedy: replace the
+    # config AND restart. Guarded by the handler's change notification so a
+    # rerun against an already-correct host doesn't bounce the collector.
+    copy:
+      dest: /etc/falcosidekick/config.yaml
+      mode: "0644"
+      content: |
+        # Elasticsearch configuration
+        elasticsearch:
+          hostport: "{{ es_address }}"
+          username: "{{ es_user }}"
+          password: "{{ es_password }}"
+          checkcert: false
+          suffix: "none"
+          index: "{{ es_index }}"
+    notify: Restart falcosidekick
+
+  - name: Create falcosidekick systemd unit
+    copy:
+      dest: /etc/systemd/system/falcosidekick.service
+      mode: "0644"
+      content: |
+        [Unit]
+        Description=Falco Sidekick
+        After=network.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/bin/falcosidekick -c /etc/falcosidekick/config.yaml
+        Restart=on-failure
+        RestartSec=5
+
+        [Install]
+        WantedBy=multi-user.target
+    notify:
+      - Reload systemd
+      - Restart falcosidekick
+
+  - name: Enable & start services
+    systemd:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    loop:
+      - falco-modern-bpf
+      - falcosidekick
+
+  # Handlers fire in the order they are DEFINED here, not the order they were
+  # notified - "Reload systemd" first so a rewritten unit file is picked up
+  # before anything is restarted against it.
+  handlers:
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+    - name: Restart Falco
+      systemd:
+        name: falco-modern-bpf
+        state: restarted
+    - name: Restart falcosidekick
+      # Picks up a rewritten /etc/falcosidekick/config.yaml. Runs after the
+      # "Enable & start services" task (handlers are flushed at end of play), so
+      # on a host where falcosidekick was not yet running this restarts a
+      # just-started unit - harmless - and on a baked host where it has been
+      # running since configure time with MHBench's Elasticsearch address, this
+      # is the only thing that makes the defender's address take effect.
+      systemd:
+        name: falcosidekick
+        state: restarted

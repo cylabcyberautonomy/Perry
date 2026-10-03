@@ -1,0 +1,25 @@
+# Hand-built manifest - this repo ships
+# no dependency file of its own. Derived from a static scan of every import
+# actually used across ansible/, config/, defender/, environment/, utility/.
+#
+# ansible / ansible-runner / openstacksdk / pydantic versions match
+# ../MHBench/pyproject.toml (same OpenStack cloud, same kind of ansible_runner
+# usage, already proven to work against these hosts).
+pydantic>=2.12.0
+elasticsearch
+openstacksdk>=4.5.0
+ansible==10.4.0
+ansible-runner>=2.4.1
+rich
+structlog
+Faker
+python-dotenv
+
+# LangChain: direct providers (Anthropic/OpenAI/Google) plus the OpenRouter/
+# LiteLLM routing added to defender/agents/langchain_registry.py - both ride
+# the OpenAI-compatible ChatOpenAI client, so no extra packages beyond these.
+langchain-core
+langchain-openai
+langchain-anthropic
+langchain-google-genai
+passlib

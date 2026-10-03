@@ -1,0 +1,9 @@
+---
+- hosts: "{{ host }}"
+  become: true
+  become_user: "{{ host_user }}"
+  tasks:
+    - name: Copy data
+      ansible.builtin.copy:
+        src: "{{ src_path }}"
+        dest: "{{ dst_path }}"
